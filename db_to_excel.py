@@ -39,6 +39,9 @@ DESC_INHOUD_DEFAULT = 'Inhoud (MT)'
 DESC_INHOUD_ALIASES = {'inhoud (mt)', 'actuele inhoud (mt)'}
 DESC_NIVEAU_ALIASES = {'niveau (%)', 'niveau (pct)', 'niveau(%)'}
 UOM_PCT_ALIASES = {'pct', '%'}
+UOM_MM_ALIASES = {'mm'}
+DESC_NIVEAU_MM_ALIASES = {'niveau (mm)', 'niveau(mm)'}
+NIVEAU_KEYWORD = 'niveau'
 TANKSHAPE_VERTICAL_ALIASES = {'', 'nan', 'none', 'vertical', 'verticaal'}
 
 SOURCE_MEASURED = 'measured'
@@ -47,6 +50,7 @@ SOURCE_DENSITY = 'calculated_density'
 SOURCE_SKIPPED_SHAPE = 'skipped_tankshape'
 SOURCE_MISSING_NIVEAU = 'missing_niveau'
 SOURCE_MISSING_MASTERDATA = 'missing_masterdata'
+SOURCE_MISSING_MM_SPAN = 'missing_mm_span'
 
 NIVEAU_MIN_PCT = 0.0
 NIVEAU_MAX_PCT = 105.0
@@ -221,7 +225,8 @@ def load_data_from_sql():
 
         timeseriedata_query = """
         SELECT [TagName], [MESServer], [LatestTs], [LatestValue], [UnitOfMeasure],
-               [RecordType], [IP_STEPPED], [TagDescription]
+               [RecordType], [IP_STEPPED], [TagDescription],
+               [IP_GRAPH_MAXIMUM], [IP_GRAPH_MINIMUM]
         FROM [mes].[timeseriedata]
         """
 
@@ -248,35 +253,61 @@ def load_data_from_sql():
 
 
 def build_niveau_lookup(merged_df: pd.DataFrame) -> dict:
-    pct_mask = (merged_df['UnitOfMeasure'].map(normalize_text).isin(UOM_PCT_ALIASES) &
-                pd.to_numeric(merged_df['LatestValue'], errors='coerce').notna())
-    pct_rows = merged_df[pct_mask].copy()
-    pct_rows['LatestValue'] = pd.to_numeric(pct_rows['LatestValue'], errors='coerce')
-    pct_rows['_is_niveau_desc'] = desc_mask(pct_rows['Desc'], DESC_NIVEAU_ALIASES)
-    pct_rows = pct_rows.sort_values(['_is_niveau_desc', 'LatestTs'])
+    values = pd.to_numeric(merged_df['LatestValue'], errors='coerce')
+    uom_norm = merged_df['UnitOfMeasure'].map(normalize_text)
+    desc_norm = merged_df['Desc'].map(normalize_text)
+    tagdesc_norm = merged_df['TagDescription'].map(normalize_text)
+
+    pct_mask = uom_norm.isin(UOM_PCT_ALIASES) & values.notna()
+    mm_mask = (uom_norm.isin(UOM_MM_ALIASES) & values.notna() &
+               (tagdesc_norm.str.contains(NIVEAU_KEYWORD, na=False) |
+                desc_norm.isin(DESC_NIVEAU_MM_ALIASES)))
 
     lookup = {}
-    duplicates = set()
-    for idx, row in pct_rows.iterrows():
-        key = tank_key(row['messerver'], row['tank'])
-        if key in lookup:
-            duplicates.add(key)
-        lookup[key] = {
-            'idx': idx,
-            'value': row['LatestValue'],
-            'maxvolume': row['maxvolume'],
-            'maxinhoud': row['maxinhoud'],
-            'density': row['density'],
-            'tankshape': row['tankshape'],
-            'ts': row['LatestTs'],
-        }
 
-    if duplicates:
-        logger.warning(f"Multiple pct tags found for tanks {sorted(duplicates)}; "
-                       f"preferring tag with Niveau Desc, then latest timestamp")
+    def insert_rows(mask, kind, preferred_desc_aliases):
+        rows = merged_df[mask].copy()
+        rows['_pref'] = desc_mask(rows['Desc'], preferred_desc_aliases)
+        rows = rows.sort_values(['_pref', 'LatestTs'])
+        for idx, row in rows.iterrows():
+            key = tank_key(row['messerver'], row['tank'])
+            lookup[key] = {
+                'idx': idx,
+                'kind': kind,
+                'value': pd.to_numeric(row['LatestValue'], errors='coerce'),
+                'graph_min': pd.to_numeric(row.get('IP_GRAPH_MINIMUM'), errors='coerce'),
+                'graph_max': pd.to_numeric(row.get('IP_GRAPH_MAXIMUM'), errors='coerce'),
+                'maxvolume': row['maxvolume'],
+                'maxinhoud': row['maxinhoud'],
+                'density': row['density'],
+                'tankshape': row['tankshape'],
+                'ts': row['LatestTs'],
+            }
 
-    logger.info(f"Niveau lookup contains {len(lookup)} tanks with a pct value")
+    insert_rows(mm_mask, 'mm', DESC_NIVEAU_MM_ALIASES)
+    insert_rows(pct_mask, 'pct', DESC_NIVEAU_ALIASES)
+
+    kinds = pd.Series([v['kind'] for v in lookup.values()], dtype=object)
+    logger.info(f"Niveau lookup contains {len(lookup)} tanks "
+                f"(pct: {(kinds == 'pct').sum()}, mm: {(kinds == 'mm').sum()})")
     return lookup
+
+
+def resolve_niveau_pct(niveau_info, key):
+    value = pd.to_numeric(niveau_info['value'], errors='coerce')
+    if pd.isna(value):
+        return None, SOURCE_MISSING_NIVEAU
+
+    if niveau_info['kind'] == 'pct':
+        return value, None
+
+    graph_max = niveau_info['graph_max']
+    graph_min = niveau_info['graph_min'] if pd.notna(niveau_info['graph_min']) else 0.0
+    if pd.isna(graph_max) or graph_max <= graph_min:
+        logger.warning(f"Tank {key}: mm level tag without usable IP_GRAPH_MAXIMUM/MINIMUM span")
+        return None, SOURCE_MISSING_MM_SPAN
+
+    return (value - graph_min) / (graph_max - graph_min) * 100.0, None
 
 # --------------------------------------------------------------------------------------------------------------
 # INHOUD (MT) FALLBACK CALCULATION
@@ -287,18 +318,20 @@ def compute_inhoud_fallback(niveau_info, row_maxvolume, row_maxinhoud, row_densi
     if niveau_info is None:
         return None, SOURCE_MISSING_NIVEAU
 
-    niveau = pd.to_numeric(niveau_info['value'], errors='coerce')
+    niveau, error_source = resolve_niveau_pct(niveau_info, key)
+    if error_source is not None:
+        return None, error_source
+
     maxvolume = coalesce_numeric(row_maxvolume, niveau_info['maxvolume'])
     maxinhoud = coalesce_numeric(row_maxinhoud, niveau_info['maxinhoud'])
     density = coalesce_numeric(row_density, niveau_info['density'])
     tankshape = row_tankshape if normalize_text(row_tankshape) else niveau_info['tankshape']
-
-    if pd.isna(niveau):
-        return None, SOURCE_MISSING_NIVEAU
+    suffix = '_mm' if niveau_info['kind'] == 'mm' else ''
 
     if niveau < NIVEAU_MIN_PCT or niveau > NIVEAU_MAX_PCT:
-        logger.warning(f"Tank {key}: niveau {niveau} outside plausible range, skipping calculation")
-        return None, SOURCE_MISSING_NIVEAU
+        logger.warning(f"Tank {key}: derived niveau {niveau:.1f} pct outside plausible range, "
+                       f"skipping calculation")
+        return None, SOURCE_MISSING_NIVEAU + suffix
 
     if not is_vertical(tankshape):
         logger.warning(f"Tank {key}: tankshape '{tankshape}' is not vertical, "
@@ -306,11 +339,11 @@ def compute_inhoud_fallback(niveau_info, row_maxvolume, row_maxinhoud, row_densi
         return None, SOURCE_SKIPPED_SHAPE
 
     if pd.notna(maxinhoud) and maxinhoud > 0:
-        return maxinhoud * (niveau / 100.0), SOURCE_MAXINHOUD
+        return maxinhoud * (niveau / 100.0), SOURCE_MAXINHOUD + suffix
 
     if pd.notna(density) and pd.notna(maxvolume) and maxvolume > 0:
         if DENSITY_MIN_T_M3 <= density <= DENSITY_MAX_T_M3:
-            return maxvolume * (niveau / 100.0) * density, SOURCE_DENSITY
+            return maxvolume * (niveau / 100.0) * density, SOURCE_DENSITY + suffix
         logger.warning(f"Tank {key}: density {density} not plausible as t/m3, calculation skipped")
 
     return None, SOURCE_MISSING_MASTERDATA
@@ -496,8 +529,8 @@ def log_missing_inhoud_diagnostics(result_df, niveau_lookup, final_inhoud_mask):
             'Tank': result_df.at[idx, 'Tank'],
             'MES Server': result_df.at[idx, 'MES Server'],
             'Reason': result_df.at[idx, 'InhoudSource'],
-            'PctValueFound': info is not None,
-            'PctValue': info['value'] if info else None,
+            'LevelKind': info['kind'] if info else None,
+            'LevelValue': info['value'] if info else None,
             'MaxVolume': result_df.at[idx, 'MaxVolume (M3)'],
             'MaxInhoud': result_df.at[idx, 'MaxInhoud (MT)'],
         })
