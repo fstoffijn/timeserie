@@ -554,7 +554,7 @@ def merge_and_transform_data(mestags_df, timeseriedata_df):
     result_df['MaxVolume (M3)'] = merged_df['maxvolume']
     result_df['MaxInhoud (MT)'] = merged_df['maxinhoud']
     result_df['Coordinates'] = merged_df['coordinates']
-    result_df['StaticProduct'] = merged_df['staticproduct']
+    result_df['StaticProduct'] = build_product_label(merged_df)
     result_df['Tenant'] = merged_df['tenant']
     result_df['Plant'] = merged_df['plant']
     result_df['Area'] = merged_df['area']
@@ -624,6 +624,18 @@ def synthesize_missing_inhoud_rows(result_df, niveau_lookup, inhoud_mask):
 # --------------------------------------------------------------------------------------------------------------
 # TANK STATUS AND MANUAL OVERRIDES
 # --------------------------------------------------------------------------------------------------------------
+
+
+def build_product_label(merged_df: pd.DataFrame) -> pd.Series:
+    product = merged_df['staticproduct'].fillna('').astype(str).str.strip()
+    status = merged_df['tankstatus'].fillna('').astype(str).str.strip()
+    until = pd.to_datetime(merged_df['override_until'], errors='coerce')
+    today = pd.Timestamp.today().normalize()
+
+    active = (status != '') & ~(until.notna() & (until < today))
+    combined = (product + ' (' + status + ')').where(product != '', status)
+    label = combined.where(active, product)
+    return label.where(label != '', None)
 
 
 def build_override_map(merged_df: pd.DataFrame) -> dict:
