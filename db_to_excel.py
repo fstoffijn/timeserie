@@ -36,15 +36,23 @@ logger = logging.getLogger(__name__)
 ENV_VERSION = os.getenv('ENV_VERSION', 'DEV')
 
 DESC_INHOUD_DEFAULT = 'Inhoud (MT)'
-DESC_INHOUD_ALIASES = {'inhoud (mt)', 'actuele inhoud (mt)'}
+DESC_INHOUD_ALIASES = {'inhoud (mt)', 'inhoud(mt)', 'actuele inhoud (mt)', 'actuele inhoud(mt)'}
 DESC_NIVEAU_ALIASES = {'niveau (%)', 'niveau (pct)', 'niveau(%)'}
 UOM_PCT_ALIASES = {'pct', '%'}
 UOM_MM_ALIASES = {'mm'}
+UOM_TON_ALIASES = {'ton', 't', 'mt', 'tonnes', 'tonne'}
+UOM_KG_ALIASES = {'kg'}
+DESC_TON_ALIASES = {'ton', 't', 'mt', 'inhoud (ton)', 'niveau (ton)', 'niveau (mt)'}
+DESC_KG_ALIASES = {'kg', 'inhoud (kg)', 'niveau (kg)'}
+MASS_KEYWORDS = ('niveau', 'inhoud')
 DESC_NIVEAU_MM_ALIASES = {'niveau (mm)', 'niveau(mm)'}
 NIVEAU_KEYWORD = 'niveau'
 TANKSHAPE_VERTICAL_ALIASES = {'', 'nan', 'none', 'vertical', 'verticaal'}
 
 SOURCE_MEASURED = 'measured'
+SOURCE_MEASURED_MASSTAG = 'measured_masstag'
+SOURCE_IMPLAUSIBLE_MASS = 'implausible_mass'
+SOURCE_IMPLAUSIBLE_GEOMETRY = 'implausible_geometry'
 SOURCE_MAXINHOUD = 'calculated_maxinhoud'
 SOURCE_DENSITY = 'calculated_density'
 SOURCE_SKIPPED_SHAPE = 'skipped_tankshape'
@@ -62,6 +70,9 @@ NIVEAU_MAX_PCT = 105.0
 DENSITY_MIN_T_M3 = 0.05
 DENSITY_MAX_T_M3 = 5.0
 GEOMETRY_TOLERANCE = 0.02
+MEASURED_TOLERANCE = 0.05
+DIAMETER_MAX_M = 150.0
+WALL_HEIGHT_MAX_M = 60.0
 
 MASTER_COLUMNS = ['maxvolume', 'maxinhoud', 'density', 'tankshape', 'diameter_m', 'hoogte_wand_m']
 
@@ -275,20 +286,30 @@ def load_data_from_sql():
 # --------------------------------------------------------------------------------------------------------------
 
 
-def build_niveau_lookup(merged_df: pd.DataFrame) -> dict:
+def build_niveau_lookup(merged_df: pd.DataFrame, inhoud_mask: pd.Series) -> dict:
     values = pd.to_numeric(merged_df['LatestValue'], errors='coerce')
     uom_norm = merged_df['UnitOfMeasure'].map(normalize_text)
     desc_norm = merged_df['Desc'].map(normalize_text)
     tagdesc_norm = merged_df['TagDescription'].map(normalize_text)
 
-    pct_mask = uom_norm.isin(UOM_PCT_ALIASES) & values.notna()
-    mm_mask = (uom_norm.isin(UOM_MM_ALIASES) & values.notna() &
+    keyword_mask = pd.Series(False, index=merged_df.index)
+    for keyword in MASS_KEYWORDS:
+        keyword_mask |= tagdesc_norm.str.contains(keyword, na=False)
+
+    ton_mask = ((uom_norm.isin(UOM_TON_ALIASES) & keyword_mask) | desc_norm.isin(DESC_TON_ALIASES))
+    kg_mask = ((uom_norm.isin(UOM_KG_ALIASES) & keyword_mask) | desc_norm.isin(DESC_KG_ALIASES))
+    ton_mask = ton_mask & values.notna() & ~inhoud_mask
+    kg_mask = kg_mask & values.notna() & ~inhoud_mask & ~ton_mask
+    mass_mask = ton_mask | kg_mask
+
+    pct_mask = uom_norm.isin(UOM_PCT_ALIASES) & values.notna() & ~inhoud_mask & ~mass_mask
+    mm_mask = (uom_norm.isin(UOM_MM_ALIASES) & values.notna() & ~inhoud_mask & ~mass_mask &
                (tagdesc_norm.str.contains(NIVEAU_KEYWORD, na=False) |
                 desc_norm.isin(DESC_NIVEAU_MM_ALIASES)))
 
     lookup = {}
 
-    def insert_rows(mask, kind, preferred_desc_aliases):
+    def insert_rows(mask, kind, preferred_desc_aliases, factor=1.0):
         rows = merged_df[mask].copy()
         rows['_pref'] = desc_mask(rows['Desc'], preferred_desc_aliases)
         rows = rows.sort_values(['_pref', 'LatestTs'])
@@ -298,6 +319,7 @@ def build_niveau_lookup(merged_df: pd.DataFrame) -> dict:
                 'idx': idx,
                 'kind': kind,
                 'value': pd.to_numeric(row['LatestValue'], errors='coerce'),
+                'factor': factor,
                 'graph_min': pd.to_numeric(row.get('IP_GRAPH_MINIMUM'), errors='coerce'),
                 'graph_max': pd.to_numeric(row.get('IP_GRAPH_MAXIMUM'), errors='coerce'),
                 'ts': row['LatestTs'],
@@ -308,10 +330,13 @@ def build_niveau_lookup(merged_df: pd.DataFrame) -> dict:
 
     insert_rows(mm_mask, 'mm', DESC_NIVEAU_MM_ALIASES)
     insert_rows(pct_mask, 'pct', DESC_NIVEAU_ALIASES)
+    insert_rows(kg_mask, 'mass', DESC_INHOUD_ALIASES, factor=0.001)
+    insert_rows(ton_mask, 'mass', DESC_INHOUD_ALIASES, factor=1.0)
 
     kinds = pd.Series([v['kind'] for v in lookup.values()], dtype=object)
-    logger.info(f"Niveau lookup contains {len(lookup)} tanks "
-                f"(pct: {(kinds == 'pct').sum()}, mm: {(kinds == 'mm').sum()})")
+    logger.info(f"Level/mass lookup contains {len(lookup)} tanks "
+                f"(mass: {(kinds == 'mass').sum()}, pct: {(kinds == 'pct').sum()}, "
+                f"mm: {(kinds == 'mm').sum()})")
     return lookup
 
 # --------------------------------------------------------------------------------------------------------------
@@ -324,6 +349,11 @@ def resolve_mm_reference(niveau_info, master, key):
     diameter = pd.to_numeric(master['diameter_m'], errors='coerce')
     wall_m = pd.to_numeric(master['hoogte_wand_m'], errors='coerce')
     wall_mm = wall_m * 1000.0 if pd.notna(wall_m) and wall_m > 0 else None
+
+    if (pd.notna(diameter) and diameter > DIAMETER_MAX_M) or (pd.notna(wall_m) and wall_m > WALL_HEIGHT_MAX_M):
+        logger.warning(f"Tank {key}: diameter {diameter} m / wall height {wall_m} m not plausible; "
+                       f"check for a thousand-separator entry error (e.g. 21.000 stored as 21000)")
+        return None, None, SOURCE_IMPLAUSIBLE_GEOMETRY
 
     if pd.notna(diameter) and diameter > 0 and pd.notna(maxvolume) and maxvolume > 0:
         area_m2 = math.pi * (diameter / 2.0) ** 2
@@ -371,6 +401,17 @@ def compute_inhoud_fallback(niveau_info, row_master, key):
         return None, SOURCE_MISSING_NIVEAU
 
     master = merge_master_data(row_master, niveau_info)
+
+    if niveau_info['kind'] == 'mass':
+        mass = pd.to_numeric(niveau_info['value'], errors='coerce') * niveau_info['factor']
+        maxinhoud = master['maxinhoud']
+        if pd.isna(mass) or mass < 0:
+            return None, SOURCE_MISSING_NIVEAU
+        if pd.notna(maxinhoud) and maxinhoud > 0 and mass > maxinhoud * (1.0 + MEASURED_TOLERANCE):
+            logger.warning(f"Tank {key}: mass tag value {mass:.1f} MT exceeds maxinhoud {maxinhoud:.1f}; "
+                           f"check tag unit, calculation skipped")
+            return None, SOURCE_IMPLAUSIBLE_MASS
+        return mass, SOURCE_MEASURED_MASSTAG
 
     if not is_vertical(master['tankshape']):
         logger.warning(f"Tank {key}: tankshape '{master['tankshape']}' is not vertical, "
@@ -432,10 +473,6 @@ def merge_and_transform_data(mestags_df, timeseriedata_df):
     inhoud_mask = desc_mask(merged_df['Desc'], DESC_INHOUD_ALIASES)
     logger.info(f"Rows recognized as Inhoud: {inhoud_mask.sum()}")
 
-    inhoud_desc_values = merged_df.loc[inhoud_mask, 'Desc'].dropna()
-    canonical_inhoud_desc = (inhoud_desc_values.mode().iloc[0]
-                             if not inhoud_desc_values.empty else DESC_INHOUD_DEFAULT)
-
     result_df = pd.DataFrame()
     result_df['Tags'] = merged_df['tag']
     result_df['MES Server'] = merged_df['messerver']
@@ -444,7 +481,7 @@ def merge_and_transform_data(mestags_df, timeseriedata_df):
     result_df['Data type'] = merged_df['RecordType']
     result_df['Default'] = merged_df['IP_STEPPED']
     result_df['Tank'] = merged_df['tank']
-    result_df['Desc'] = merged_df['Desc']
+    result_df['Desc'] = merged_df['Desc'].where(~inhoud_mask, DESC_INHOUD_DEFAULT)
     result_df['TankCheck'] = merged_df['TankCheck']
     result_df['IP_DESCRIPTION'] = merged_df['IP_DESCRIPTION']
     result_df['IP_INPUT_TIME'] = merged_df['LatestTs']
@@ -466,6 +503,20 @@ def merge_and_transform_data(mestags_df, timeseriedata_df):
             merged_df.at[idx, 'calculation']
         )
 
+    uom_norm = merged_df['UnitOfMeasure'].map(normalize_text)
+    no_calc_mask = inhoud_mask & ~calculation_mask & pd.to_numeric(result_df['Calculation'], errors='coerce').notna()
+    kg_auto_mask = no_calc_mask & uom_norm.isin(UOM_KG_ALIASES)
+    for idx in result_df[kg_auto_mask].index:
+        result_df.at[idx, 'Calculation'] = pd.to_numeric(result_df.at[idx, 'Calculation'], errors='coerce') * 0.001
+    if kg_auto_mask.any():
+        logger.info(f"Converted {kg_auto_mask.sum()} measured Inhoud rows from kg to MT based on UnitOfMeasure")
+
+    unit_mismatch_mask = no_calc_mask & ~uom_norm.isin(UOM_KG_ALIASES | UOM_TON_ALIASES)
+    for idx in result_df[unit_mismatch_mask].index:
+        logger.warning(f"Tank {result_df.at[idx, 'Tank']}: Inhoud tag {result_df.at[idx, 'Tags']} has "
+                       f"UnitOfMeasure '{merged_df.at[idx, 'UnitOfMeasure']}', value used as MT; "
+                       f"verify the unit in MES")
+
     result_df['Calculation'] = pd.to_numeric(result_df['Calculation'], errors='coerce')
 
     # ----------------------------------------------------------------------------------------------------------
@@ -475,10 +526,17 @@ def merge_and_transform_data(mestags_df, timeseriedata_df):
     measured_mask = inhoud_mask & result_df['Calculation'].notna()
     result_df.loc[measured_mask, 'InhoudSource'] = SOURCE_MEASURED
 
+    maxinhoud_series = pd.to_numeric(merged_df['maxinhoud'], errors='coerce')
+    implausible_mask = (measured_mask & maxinhoud_series.notna() &
+                        (result_df['Calculation'] > maxinhoud_series * (1.0 + MEASURED_TOLERANCE)))
+    for idx in result_df[implausible_mask].index:
+        logger.warning(f"Tank {result_df.at[idx, 'Tank']}: measured Inhoud {result_df.at[idx, 'Calculation']:.1f} "
+                       f"exceeds maxinhoud {maxinhoud_series.at[idx]:.1f}; check tag unit or Desc classification")
+
     # ----------------------------------------------------------------------------------------------------------
     # STEP 3: FILL EMPTY INHOUD ROWS FROM LEVEL TAG AND TANK MASTER DATA
     # ----------------------------------------------------------------------------------------------------------
-    niveau_lookup = build_niveau_lookup(merged_df)
+    niveau_lookup = build_niveau_lookup(merged_df, inhoud_mask)
 
     fallback_mask = inhoud_mask & result_df['Calculation'].isna()
     for idx in result_df[fallback_mask].index:
@@ -506,9 +564,7 @@ def merge_and_transform_data(mestags_df, timeseriedata_df):
     # ----------------------------------------------------------------------------------------------------------
     # STEP 4: SYNTHESIZE INHOUD ROWS FOR TANKS WITH A LEVEL TAG BUT NO INHOUD TAG
     # ----------------------------------------------------------------------------------------------------------
-    result_df = synthesize_missing_inhoud_rows(
-        result_df, niveau_lookup, inhoud_mask, canonical_inhoud_desc
-    )
+    result_df = synthesize_missing_inhoud_rows(result_df, niveau_lookup, inhoud_mask)
 
     # ----------------------------------------------------------------------------------------------------------
     # STEP 5: LOG SOURCE BREAKDOWN AND MISSING-VALUE DIAGNOSTICS
@@ -526,7 +582,7 @@ def merge_and_transform_data(mestags_df, timeseriedata_df):
 # --------------------------------------------------------------------------------------------------------------
 
 
-def synthesize_missing_inhoud_rows(result_df, niveau_lookup, inhoud_mask, canonical_inhoud_desc):
+def synthesize_missing_inhoud_rows(result_df, niveau_lookup, inhoud_mask):
     existing_keys = {tank_key(ms, tk) for ms, tk in
                      zip(result_df.loc[inhoud_mask, 'MES Server'], result_df.loc[inhoud_mask, 'Tank'])}
 
@@ -541,7 +597,7 @@ def synthesize_missing_inhoud_rows(result_df, niveau_lookup, inhoud_mask, canoni
             continue
 
         row = result_df.loc[info['idx']].copy()
-        row['Desc'] = canonical_inhoud_desc
+        row['Desc'] = DESC_INHOUD_DEFAULT
         row['Tags'] = f"{row['Tags']}_inhoud_calc"
         row['ip_input_value'] = None
         row['IP_ENG_UNITS'] = 'MT'
