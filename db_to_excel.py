@@ -1,9 +1,9 @@
 # db_to_excel.py
-# Last modified date (dd/mm/yy): 25/08/26
+# Last modified date (dd/mm/yy): 31/08/26
 # Purpose: Export merged tank tag data from Azure SQL to per-file Excel workbooks for Power BI,
 #          including safe evaluation of tag calculation expressions and fallback calculation of
-#          Inhoud (MT) from percentage level tags (UnitOfMeasure = pct) combined with tank
-#          master data (maxinhoud, or maxvolume x density once density is available).
+#          Inhoud (MT) from level tags (pct, or mm converted via tank geometry / wall height /
+#          graph limits) combined with tank master data (maxinhoud, or maxvolume x density).
 
 # --------------------------------------------------------------------------------------------------------------
 # LOAD LIBRARIES
@@ -51,11 +51,19 @@ SOURCE_SKIPPED_SHAPE = 'skipped_tankshape'
 SOURCE_MISSING_NIVEAU = 'missing_niveau'
 SOURCE_MISSING_MASTERDATA = 'missing_masterdata'
 SOURCE_MISSING_MM_SPAN = 'missing_mm_span'
+SOURCE_INCONSISTENT_GEOMETRY = 'inconsistent_geometry'
+
+MM_REF_GEOMETRY = '_mm_geom'
+MM_REF_WALL = '_mm_wall'
+MM_REF_GRAPH = '_mm_graph'
 
 NIVEAU_MIN_PCT = 0.0
 NIVEAU_MAX_PCT = 105.0
 DENSITY_MIN_T_M3 = 0.05
 DENSITY_MAX_T_M3 = 5.0
+GEOMETRY_TOLERANCE = 0.02
+
+MASTER_COLUMNS = ['maxvolume', 'maxinhoud', 'density', 'tankshape', 'diameter_m', 'hoogte_wand_m']
 
 # --------------------------------------------------------------------------------------------------------------
 # DATABASE CONNECTION CLASS
@@ -203,6 +211,21 @@ def coalesce_numeric(primary, secondary):
         return primary
     return pd.to_numeric(secondary, errors='coerce')
 
+
+def master_data_from_row(merged_df: pd.DataFrame, idx) -> dict:
+    return {col: merged_df.at[idx, col] for col in MASTER_COLUMNS}
+
+
+def merge_master_data(row_master: dict, niveau_master: dict) -> dict:
+    merged = {}
+    for col in MASTER_COLUMNS:
+        if col == 'tankshape':
+            merged[col] = (row_master[col] if normalize_text(row_master[col])
+                           else niveau_master[col])
+        else:
+            merged[col] = coalesce_numeric(row_master[col], niveau_master[col])
+    return merged
+
 # --------------------------------------------------------------------------------------------------------------
 # LOAD DATA FROM SQL
 # --------------------------------------------------------------------------------------------------------------
@@ -219,7 +242,7 @@ def load_data_from_sql():
                [IP_DESCRIPTION], [maxvolume], [maxinhoud], [coordinates],
                [staticproduct], [tenant], [plant], [area], [contact],
                [staticdesc], [gevicode], [comment], [filename], [calculation],
-               [tankshape], [density]
+               [tankshape], [density], [diameter_m], [hoogte_wand_m]
         FROM [mes].[mestags]
         """
 
@@ -248,7 +271,7 @@ def load_data_from_sql():
         engine.dispose()
 
 # --------------------------------------------------------------------------------------------------------------
-# NIVEAU (PCT) LOOKUP BASED ON UNIT OF MEASURE
+# NIVEAU LOOKUP (PCT AND MM LEVEL TAGS) BASED ON UNIT OF MEASURE
 # --------------------------------------------------------------------------------------------------------------
 
 
@@ -271,18 +294,17 @@ def build_niveau_lookup(merged_df: pd.DataFrame) -> dict:
         rows = rows.sort_values(['_pref', 'LatestTs'])
         for idx, row in rows.iterrows():
             key = tank_key(row['messerver'], row['tank'])
-            lookup[key] = {
+            entry = {
                 'idx': idx,
                 'kind': kind,
                 'value': pd.to_numeric(row['LatestValue'], errors='coerce'),
                 'graph_min': pd.to_numeric(row.get('IP_GRAPH_MINIMUM'), errors='coerce'),
                 'graph_max': pd.to_numeric(row.get('IP_GRAPH_MAXIMUM'), errors='coerce'),
-                'maxvolume': row['maxvolume'],
-                'maxinhoud': row['maxinhoud'],
-                'density': row['density'],
-                'tankshape': row['tankshape'],
                 'ts': row['LatestTs'],
             }
+            for col in MASTER_COLUMNS:
+                entry[col] = row[col]
+            lookup[key] = entry
 
     insert_rows(mm_mask, 'mm', DESC_NIVEAU_MM_ALIASES)
     insert_rows(pct_mask, 'pct', DESC_NIVEAU_ALIASES)
@@ -292,51 +314,81 @@ def build_niveau_lookup(merged_df: pd.DataFrame) -> dict:
                 f"(pct: {(kinds == 'pct').sum()}, mm: {(kinds == 'mm').sum()})")
     return lookup
 
+# --------------------------------------------------------------------------------------------------------------
+# MM LEVEL TO PERCENTAGE CONVERSION (GEOMETRY > WALL HEIGHT > GRAPH LIMITS)
+# --------------------------------------------------------------------------------------------------------------
 
-def resolve_niveau_pct(niveau_info, key):
-    value = pd.to_numeric(niveau_info['value'], errors='coerce')
-    if pd.isna(value):
-        return None, SOURCE_MISSING_NIVEAU
 
-    if niveau_info['kind'] == 'pct':
-        return value, None
+def resolve_mm_reference(niveau_info, master, key):
+    maxvolume = pd.to_numeric(master['maxvolume'], errors='coerce')
+    diameter = pd.to_numeric(master['diameter_m'], errors='coerce')
+    wall_m = pd.to_numeric(master['hoogte_wand_m'], errors='coerce')
+    wall_mm = wall_m * 1000.0 if pd.notna(wall_m) and wall_m > 0 else None
+
+    if pd.notna(diameter) and diameter > 0 and pd.notna(maxvolume) and maxvolume > 0:
+        area_m2 = math.pi * (diameter / 2.0) ** 2
+        full_mm = maxvolume / area_m2 * 1000.0
+        if wall_mm is not None and full_mm > wall_mm * (1.0 + GEOMETRY_TOLERANCE):
+            logger.warning(f"Tank {key}: maxvolume {maxvolume} m3 with diameter {diameter} m implies "
+                           f"a fill height of {full_mm / 1000.0:.2f} m, above wall height {wall_m} m; "
+                           f"master data inconsistent, calculation skipped")
+            return None, None, SOURCE_INCONSISTENT_GEOMETRY
+        return 0.0, full_mm, MM_REF_GEOMETRY
+
+    if wall_mm is not None:
+        return 0.0, wall_mm, MM_REF_WALL
 
     graph_max = niveau_info['graph_max']
     graph_min = niveau_info['graph_min'] if pd.notna(niveau_info['graph_min']) else 0.0
     if pd.isna(graph_max) or graph_max <= graph_min:
-        logger.warning(f"Tank {key}: mm level tag without usable IP_GRAPH_MAXIMUM/MINIMUM span")
-        return None, SOURCE_MISSING_MM_SPAN
+        logger.warning(f"Tank {key}: mm level tag without diameter, wall height or usable graph limits")
+        return None, None, SOURCE_MISSING_MM_SPAN
 
-    return (value - graph_min) / (graph_max - graph_min) * 100.0, None
+    return graph_min, graph_max, MM_REF_GRAPH
+
+
+def resolve_niveau_pct(niveau_info, master, key):
+    value = pd.to_numeric(niveau_info['value'], errors='coerce')
+    if pd.isna(value):
+        return None, SOURCE_MISSING_NIVEAU, ''
+
+    if niveau_info['kind'] == 'pct':
+        return value, None, ''
+
+    empty_mm, full_mm, ref = resolve_mm_reference(niveau_info, master, key)
+    if full_mm is None:
+        return None, ref, ''
+
+    return (value - empty_mm) / (full_mm - empty_mm) * 100.0, None, ref
 
 # --------------------------------------------------------------------------------------------------------------
 # INHOUD (MT) FALLBACK CALCULATION
 # --------------------------------------------------------------------------------------------------------------
 
 
-def compute_inhoud_fallback(niveau_info, row_maxvolume, row_maxinhoud, row_density, row_tankshape, key):
+def compute_inhoud_fallback(niveau_info, row_master, key):
     if niveau_info is None:
         return None, SOURCE_MISSING_NIVEAU
 
-    niveau, error_source = resolve_niveau_pct(niveau_info, key)
+    master = merge_master_data(row_master, niveau_info)
+
+    if not is_vertical(master['tankshape']):
+        logger.warning(f"Tank {key}: tankshape '{master['tankshape']}' is not vertical, "
+                       f"linear niveau-to-mass calculation skipped")
+        return None, SOURCE_SKIPPED_SHAPE
+
+    niveau, error_source, suffix = resolve_niveau_pct(niveau_info, master, key)
     if error_source is not None:
         return None, error_source
-
-    maxvolume = coalesce_numeric(row_maxvolume, niveau_info['maxvolume'])
-    maxinhoud = coalesce_numeric(row_maxinhoud, niveau_info['maxinhoud'])
-    density = coalesce_numeric(row_density, niveau_info['density'])
-    tankshape = row_tankshape if normalize_text(row_tankshape) else niveau_info['tankshape']
-    suffix = '_mm' if niveau_info['kind'] == 'mm' else ''
 
     if niveau < NIVEAU_MIN_PCT or niveau > NIVEAU_MAX_PCT:
         logger.warning(f"Tank {key}: derived niveau {niveau:.1f} pct outside plausible range, "
                        f"skipping calculation")
         return None, SOURCE_MISSING_NIVEAU + suffix
 
-    if not is_vertical(tankshape):
-        logger.warning(f"Tank {key}: tankshape '{tankshape}' is not vertical, "
-                       f"linear niveau-to-mass calculation skipped")
-        return None, SOURCE_SKIPPED_SHAPE
+    maxinhoud = master['maxinhoud']
+    maxvolume = master['maxvolume']
+    density = master['density']
 
     if pd.notna(maxinhoud) and maxinhoud > 0:
         return maxinhoud * (niveau / 100.0), SOURCE_MAXINHOUD + suffix
@@ -424,7 +476,7 @@ def merge_and_transform_data(mestags_df, timeseriedata_df):
     result_df.loc[measured_mask, 'InhoudSource'] = SOURCE_MEASURED
 
     # ----------------------------------------------------------------------------------------------------------
-    # STEP 3: FILL EMPTY INHOUD ROWS FROM PCT TAG AND TANK MASTER DATA
+    # STEP 3: FILL EMPTY INHOUD ROWS FROM LEVEL TAG AND TANK MASTER DATA
     # ----------------------------------------------------------------------------------------------------------
     niveau_lookup = build_niveau_lookup(merged_df)
 
@@ -432,12 +484,7 @@ def merge_and_transform_data(mestags_df, timeseriedata_df):
     for idx in result_df[fallback_mask].index:
         key = tank_key(result_df.at[idx, 'MES Server'], result_df.at[idx, 'Tank'])
         value, source = compute_inhoud_fallback(
-            niveau_lookup.get(key),
-            merged_df.at[idx, 'maxvolume'],
-            merged_df.at[idx, 'maxinhoud'],
-            merged_df.at[idx, 'density'],
-            merged_df.at[idx, 'tankshape'],
-            key
+            niveau_lookup.get(key), master_data_from_row(merged_df, idx), key
         )
         result_df.at[idx, 'Calculation'] = value
         result_df.at[idx, 'InhoudSource'] = source
@@ -457,7 +504,7 @@ def merge_and_transform_data(mestags_df, timeseriedata_df):
     result_df['filename'] = merged_df['filename']
 
     # ----------------------------------------------------------------------------------------------------------
-    # STEP 4: SYNTHESIZE INHOUD ROWS FOR TANKS WITH A PCT TAG BUT NO INHOUD TAG
+    # STEP 4: SYNTHESIZE INHOUD ROWS FOR TANKS WITH A LEVEL TAG BUT NO INHOUD TAG
     # ----------------------------------------------------------------------------------------------------------
     result_df = synthesize_missing_inhoud_rows(
         result_df, niveau_lookup, inhoud_mask, canonical_inhoud_desc
@@ -488,11 +535,9 @@ def synthesize_missing_inhoud_rows(result_df, niveau_lookup, inhoud_mask, canoni
         if key in existing_keys:
             continue
 
-        value, source = compute_inhoud_fallback(
-            info, info['maxvolume'], info['maxinhoud'], info['density'], info['tankshape'], key
-        )
+        value, source = compute_inhoud_fallback(info, info, key)
         if value is None:
-            logger.info(f"Tank {key}: has pct tag but no Inhoud row could be synthesized ({source})")
+            logger.info(f"Tank {key}: has level tag but no Inhoud row could be synthesized ({source})")
             continue
 
         row = result_df.loc[info['idx']].copy()
@@ -533,6 +578,8 @@ def log_missing_inhoud_diagnostics(result_df, niveau_lookup, final_inhoud_mask):
             'LevelValue': info['value'] if info else None,
             'MaxVolume': result_df.at[idx, 'MaxVolume (M3)'],
             'MaxInhoud': result_df.at[idx, 'MaxInhoud (MT)'],
+            'Diameter': info['diameter_m'] if info else None,
+            'HoogteWand': info['hoogte_wand_m'] if info else None,
         })
 
     diag_df = pd.DataFrame(diag_rows)
