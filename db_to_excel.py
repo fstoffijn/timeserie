@@ -50,6 +50,9 @@ NIVEAU_KEYWORD = 'niveau'
 TANKSHAPE_VERTICAL_ALIASES = {'', 'nan', 'none', 'vertical', 'verticaal'}
 
 SOURCE_MEASURED = 'measured'
+SOURCE_OVERRIDE = 'override'
+FORCE_ZERO_STATUSES = {'maintenance', 'onderhoud', 'empty', 'leeg', 'out of service', 'out_of_service',
+                       'buiten gebruik', 'buiten_gebruik', 'cleaning', 'reiniging'}
 SOURCE_MEASURED_MASSTAG = 'measured_masstag'
 SOURCE_IMPLAUSIBLE_MASS = 'implausible_mass'
 SOURCE_IMPLAUSIBLE_GEOMETRY = 'implausible_geometry'
@@ -253,7 +256,8 @@ def load_data_from_sql():
                [IP_DESCRIPTION], [maxvolume], [maxinhoud], [coordinates],
                [staticproduct], [tenant], [plant], [area], [contact],
                [staticdesc], [gevicode], [comment], [filename], [calculation],
-               [tankshape], [density], [diameter_m], [hoogte_wand_m]
+               [tankshape], [density], [diameter_m], [hoogte_wand_m],
+               [tankstatus], [inhoud_override_mt], [override_until]
         FROM [mes].[mestags]
         """
 
@@ -559,12 +563,18 @@ def merge_and_transform_data(mestags_df, timeseriedata_df):
     result_df['Check if any data for tank (listing only one of the descriptors)?'] = merged_df['TagDescription']
     result_df['GEVI Code'] = merged_df['gevicode']
     result_df['Comment'] = merged_df['comment']
+    result_df['TankStatus'] = merged_df['tankstatus']
     result_df['filename'] = merged_df['filename']
 
     # ----------------------------------------------------------------------------------------------------------
     # STEP 4: SYNTHESIZE INHOUD ROWS FOR TANKS WITH A LEVEL TAG BUT NO INHOUD TAG
     # ----------------------------------------------------------------------------------------------------------
     result_df = synthesize_missing_inhoud_rows(result_df, niveau_lookup, inhoud_mask)
+
+    # ----------------------------------------------------------------------------------------------------------
+    # STEP 4B: APPLY TANK STATUS AND MANUAL OVERRIDES (MAINTENANCE, EMPTY, KNOWN HEEL)
+    # ----------------------------------------------------------------------------------------------------------
+    result_df = apply_tank_overrides(result_df, merged_df)
 
     # ----------------------------------------------------------------------------------------------------------
     # STEP 5: LOG SOURCE BREAKDOWN AND MISSING-VALUE DIAGNOSTICS
@@ -607,6 +617,78 @@ def synthesize_missing_inhoud_rows(result_df, niveau_lookup, inhoud_mask):
 
     if new_rows:
         logger.info(f"Synthesized {len(new_rows)} Inhoud (MT) rows for tanks without an Inhoud tag")
+        result_df = pd.concat([result_df, pd.DataFrame(new_rows)], ignore_index=True)
+
+    return result_df
+
+# --------------------------------------------------------------------------------------------------------------
+# TANK STATUS AND MANUAL OVERRIDES
+# --------------------------------------------------------------------------------------------------------------
+
+
+def build_override_map(merged_df: pd.DataFrame) -> dict:
+    overrides = {}
+    today = pd.Timestamp.today().normalize()
+    for idx, row in merged_df.iterrows():
+        key = tank_key(row['messerver'], row['tank'])
+        status = normalize_text(row['tankstatus'])
+        override_value = pd.to_numeric(row['inhoud_override_mt'], errors='coerce')
+        until = pd.to_datetime(row['override_until'], errors='coerce')
+
+        if key in overrides or (not status and pd.isna(override_value)):
+            continue
+
+        if pd.notna(until) and until.normalize() < today:
+            logger.warning(f"Tank {key}: override/status '{status or override_value}' expired on "
+                           f"{until.date()}, ignored; clear it in mestags")
+            continue
+
+        forced = None
+        if pd.notna(override_value):
+            forced = float(override_value)
+        elif status in FORCE_ZERO_STATUSES:
+            forced = 0.0
+
+        if forced is None:
+            continue
+
+        overrides[key] = {'idx': idx, 'value': forced, 'status': row['tankstatus']}
+
+    if overrides:
+        logger.info(f"Applying manual overrides for {len(overrides)} tanks")
+    return overrides
+
+
+def apply_tank_overrides(result_df: pd.DataFrame, merged_df: pd.DataFrame) -> pd.DataFrame:
+    overrides = build_override_map(merged_df)
+    if not overrides:
+        return result_df
+
+    inhoud_mask = desc_mask(result_df['Desc'], DESC_INHOUD_ALIASES)
+    covered = set()
+    for idx in result_df[inhoud_mask].index:
+        key = tank_key(result_df.at[idx, 'MES Server'], result_df.at[idx, 'Tank'])
+        if key not in overrides:
+            continue
+        result_df.at[idx, 'Calculation'] = overrides[key]['value']
+        result_df.at[idx, 'InhoudSource'] = SOURCE_OVERRIDE
+        covered.add(key)
+
+    new_rows = []
+    for key, info in overrides.items():
+        if key in covered:
+            continue
+        row = result_df.loc[info['idx']].copy()
+        row['Desc'] = DESC_INHOUD_DEFAULT
+        row['Tags'] = f"{row['Tags']}_inhoud_override"
+        row['ip_input_value'] = None
+        row['IP_ENG_UNITS'] = 'MT'
+        row['Calculation'] = info['value']
+        row['InhoudSource'] = SOURCE_OVERRIDE
+        new_rows.append(row)
+
+    if new_rows:
+        logger.info(f"Synthesized {len(new_rows)} Inhoud (MT) rows for overridden tanks without an Inhoud tag")
         result_df = pd.concat([result_df, pd.DataFrame(new_rows)], ignore_index=True)
 
     return result_df
